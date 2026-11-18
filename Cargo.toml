@@ -1,0 +1,35 @@
+[package]
+name = "ade"
+version = "0.1.0"
+edition = "2021"
+description = "ADE - a minimalist Agentic Development Environment powered by Claude"
+
+[dependencies]
+iced = { version = "0.13.1", features = ["tokio", "image"] }
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+tokio = { version = "1", features = ["process", "time", "io-util", "fs"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+serde_json = "1"
+anyhow = "1"
+rfd = "0.15"
+ignore = "0.4"
+regex = "1"
+similar = "2"
+dunce = "1"
+open = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = ["Foundation", "Foundation_Collections", "Media_Control"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
