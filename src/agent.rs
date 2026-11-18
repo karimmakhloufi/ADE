@@ -51,6 +51,8 @@ pub enum AgentEvent {
     ToolCall { id: String, name: String, input: Value },
     ToolResult { id: String, output: String, is_error: bool, diff: Option<String> },
     Usage { input: u64, output: u64, cache_read: u64 },
+    /// Subscription limits (`rate_limit_info` of a `rate_limit_event`).
+    RateLimit(Value),
     Error(String),
     Done,
 }
@@ -241,6 +243,9 @@ impl Parser {
             return evs;
         }
         match v["type"].as_str().unwrap_or_default() {
+            "rate_limit_event" if v["rate_limit_info"].is_object() => {
+                evs.push(AgentEvent::RateLimit(v["rate_limit_info"].clone()));
+            }
             "system" if v["subtype"] == "init" => {
                 if let Some(id) = v["session_id"].as_str() {
                     evs.push(AgentEvent::Session { id: id.into(), model: v["model"].as_str().map(Into::into) });

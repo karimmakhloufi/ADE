@@ -62,6 +62,16 @@ pub fn save_workspace(dir: &Path) -> Result<PathBuf> {
     set("workspace", json!(dir.to_string_lossy()))
 }
 
+/// Last subscription limits reported by Claude Code (`rate_limit_info`),
+/// so they are shown at startup before the first message.
+pub fn load_rate_limits() -> Value {
+    read()["rate_limits"].clone()
+}
+
+pub fn save_rate_limits(info: &Value) -> Result<PathBuf> {
+    set("rate_limits", info.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Claude Code
 // ---------------------------------------------------------------------------

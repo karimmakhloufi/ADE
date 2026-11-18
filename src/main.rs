@@ -10,6 +10,7 @@ mod config;
 mod media;
 mod projects;
 mod sessions;
+mod usage;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use iced::widget::{
     button, column, container, horizontal_rule, horizontal_space, row, scrollable, text, text_input,
-    vertical_rule, Column,
+    tooltip, vertical_rule, Column,
 };
 use iced::{font, Alignment, Color, Element, Font, Length, Task, Theme};
 
@@ -28,6 +29,7 @@ const GREEN: Color = Color { r: 0.45, g: 0.80, b: 0.50, a: 1.0 };
 const RED: Color = Color { r: 0.92, g: 0.42, b: 0.42, a: 1.0 };
 const BLUE: Color = Color { r: 0.45, g: 0.65, b: 0.95, a: 1.0 };
 const TEXT: Color = Color { r: 0.82, g: 0.83, b: 0.86, a: 1.0 };
+const ORANGE: Color = Color { r: 0.95, g: 0.65, b: 0.30, a: 1.0 };
 const ITALIC: Font = Font { style: font::Style::Italic, ..Font::DEFAULT };
 const BOLD: Font = Font { weight: font::Weight::Bold, ..Font::DEFAULT };
 /// The default font lacks glyphs like ↻ ◐ ● ○ ✓ ✗ and iced does not fall back
@@ -95,6 +97,9 @@ enum Message {
     MediaTick,
     MediaUpdated(Option<media::NowPlaying>),
     MediaControl(media::Command),
+    // Subscription consumption (tokens of the day / of the week)
+    /// Result of the startup request that refreshes the limit percentages.
+    LimitsProbed(Option<serde_json::Value>),
     /// The user closes the window: save every conversation, then exit.
     CloseRequested(iced::window::Id),
 }
@@ -204,6 +209,9 @@ struct Ade {
     new_project: Option<NewProject>,
     status: String,
     now_playing: Option<media::NowPlaying>,
+    limits: usage::Limits,
+    /// The startup limits request was already sent.
+    limits_probed: bool,
 }
 
 impl Ade {
@@ -224,6 +232,8 @@ impl Ade {
             new_project: None,
             status: "Prêt".into(),
             now_playing: None,
+            limits: usage::Limits::parse(&config::load_rate_limits()),
+            limits_probed: false,
         };
         // First launch: Claude Code, then workspace folder.
         if config::find_claude().is_none() {
@@ -460,10 +470,15 @@ impl Ade {
                 self.claude_checking = false;
                 match result {
                     Ok(found) => {
+                        let probe = (!self.limits_probed).then(|| found.path.clone());
+                        self.limits_probed = true;
                         self.claude = Some(found);
                         if let Some(setup) = &mut self.claude_setup {
                             setup.checking = false;
                             setup.error = None;
+                        }
+                        if let Some(path) = probe {
+                            return Task::perform(usage::probe_limits(path), Message::LimitsProbed);
                         }
                     }
                     Err(e) => {
@@ -492,6 +507,11 @@ impl Ade {
             }
             Message::MediaTick => return Task::perform(media::current(), Message::MediaUpdated),
             Message::MediaUpdated(np) => self.now_playing = np,
+            Message::LimitsProbed(Some(info)) => {
+                self.limits = usage::Limits::parse(&info);
+                let _ = config::save_rate_limits(&info);
+            }
+            Message::LimitsProbed(None) => {}
             Message::MediaControl(cmd) => return Task::perform(media::control(cmd), Message::MediaUpdated),
             Message::CloseRequested(id) => {
                 for conv in self.convs.values_mut() {
@@ -591,6 +611,10 @@ impl Ade {
                 conv.tokens.1 += output;
                 conv.tokens.2 += cache_read;
             }
+            AgentEvent::RateLimit(info) => {
+                self.limits = usage::Limits::parse(&info);
+                let _ = config::save_rate_limits(&info);
+            }
             AgentEvent::Error(e) => conv.chat.push(ChatItem::Error(e)),
             AgentEvent::Done => {
                 conv.running = None;
@@ -633,6 +657,7 @@ impl Ade {
                 .color(MUTED),
             horizontal_space(),
             self.view_now_playing(),
+            self.view_usage(),
             self.view_claude_status(),
             button(text("Nouvelle conversation").size(12)).on_press(Message::NewChat).style(button::text),
         ]
@@ -858,6 +883,44 @@ impl Ade {
         ]
         .spacing(4)
         .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// Subscription limits (% of the 5-hour window and of the week); reset times in a tooltip.
+    fn view_usage(&self) -> Element<'_, Message> {
+        let now = chrono::Utc::now().timestamp();
+        let details = container(
+            column![
+                text("Limites de l'abonnement").size(12).font(BOLD),
+                text(format!("Session (5 h) : {}", self.limits.five_hour.map_or("inconnue".into(), |w| w.describe(now)))).size(11),
+                text(format!("Semaine : {}", self.limits.seven_day.map_or("inconnue".into(), |w| w.describe(now)))).size(11),
+                text("Les % sont mis à jour à chaque message envoyé à Claude.").size(11).color(MUTED),
+            ]
+            .spacing(4),
+        )
+        .padding(8)
+        .style(container::rounded_box);
+        let pct = |w: Option<usage::Window>| -> Element<'_, Message> {
+            match w.and_then(|w| w.current(now)) {
+                Some(p) => {
+                    let color = if p >= 90.0 { RED } else if p >= 70.0 { ORANGE } else { TEXT };
+                    text(format!("{p:.0} %")).size(12).color(color).into()
+                }
+                None => text("–").size(12).color(MUTED).into(),
+            }
+        };
+        tooltip(
+            row![
+                text("5 h").size(12).color(MUTED),
+                pct(self.limits.five_hour),
+                text("·  Semaine").size(12).color(MUTED),
+                pct(self.limits.seven_day),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+            details,
+            tooltip::Position::Bottom,
+        )
         .into()
     }
 
