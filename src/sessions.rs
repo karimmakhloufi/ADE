@@ -1,8 +1,9 @@
 //! Persists each project's conversation so it survives restarts.
 //!
 //! One JSON file per project in `<config dir>/conversations/`, holding the
-//! API history (the source of truth, the chat view is rebuilt from it), the
-//! token counters and the diffs shown for file edits.
+//! Claude Code session id (Claude Code keeps the context itself), the
+//! transcript the chat view is rebuilt from, the token counters and the diffs
+//! shown for file edits.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,9 @@ use serde_json::{json, Value};
 
 pub struct Saved {
     pub root: PathBuf,
+    /// Claude Code session to resume (absent in conversations saved by the
+    /// API-key version of ADE: they are shown but cannot be continued).
+    pub session: Option<String>,
     pub history: Vec<Value>,
     pub tokens: (u64, u64, u64),
     /// tool_use id -> unified diff.
@@ -41,7 +45,13 @@ fn file_for(dir: &Path, root: &Path) -> PathBuf {
 }
 
 /// Saves (or deletes, when the history is empty) the conversation of `root`.
-pub fn save(root: &Path, history: &[Value], tokens: (u64, u64, u64), diffs: &HashMap<String, String>) -> Result<()> {
+pub fn save(
+    root: &Path,
+    session: Option<&str>,
+    history: &[Value],
+    tokens: (u64, u64, u64),
+    diffs: &HashMap<String, String>,
+) -> Result<()> {
     let dir = dir().context("dossier de configuration introuvable")?;
     let path = file_for(&dir, root);
     if history.is_empty() {
@@ -52,8 +62,9 @@ pub fn save(root: &Path, history: &[Value], tokens: (u64, u64, u64), diffs: &Has
     }
     std::fs::create_dir_all(&dir)?;
     let doc = json!({
-        "version": 1,
+        "version": 2,
         "root": root.to_string_lossy(),
+        "session_id": session,
         "tokens": [tokens.0, tokens.1, tokens.2],
         "diffs": diffs,
         "history": history,
@@ -85,7 +96,8 @@ fn parse(text: &str) -> Option<Saved> {
         .as_object()
         .map(|m| m.iter().filter_map(|(k, d)| Some((k.clone(), d.as_str()?.to_string()))).collect())
         .unwrap_or_default();
-    Some(Saved { root, history, tokens: (t(0), t(1), t(2)), diffs })
+    let session = v["session_id"].as_str().map(str::to_string);
+    Some(Saved { root, session, history, tokens: (t(0), t(1), t(2)), diffs })
 }
 
 #[cfg(test)]
@@ -96,12 +108,14 @@ mod tests {
     fn roundtrip_parse() {
         let doc = json!({
             "root": "C:\\Work\\demo",
+            "session_id": "abc",
             "tokens": [1, 2, 3],
             "diffs": { "t1": "+a" },
             "history": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }],
         });
         let s = parse(&doc.to_string()).unwrap();
         assert_eq!(s.root, PathBuf::from("C:\\Work\\demo"));
+        assert_eq!(s.session.as_deref(), Some("abc"));
         assert_eq!(s.tokens, (1, 2, 3));
         assert_eq!(s.diffs["t1"], "+a");
         assert_eq!(s.history.len(), 1);

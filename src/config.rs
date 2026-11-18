@@ -1,20 +1,21 @@
-//! API key storage and validation.
-//!
-//! The key comes from `ANTHROPIC_API_KEY` when set, otherwise from the user
-//! config file (`%APPDATA%\ADE\config.json`, `~/.config/ADE/config.json`).
+//! User settings (`%APPDATA%\ADE\config.json`, `~/.config/ADE/config.json`)
+//! and detection of Claude Code, through which ADE uses the Claude subscription.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-pub const KEYS_URL: &str = "https://platform.claude.com/settings/keys";
+#[cfg(windows)]
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeySource {
-    Env,
-    Saved,
-}
+/// Shown in the setup screen.
+pub const INSTALL_COMMAND: &str = if cfg!(windows) {
+    "irm https://claude.ai/install.ps1 | iex"
+} else {
+    "curl -fsSL https://claude.ai/install.sh | bash"
+};
 
 pub fn path() -> Option<PathBuf> {
     let base = if cfg!(windows) {
@@ -22,9 +23,13 @@ pub fn path() -> Option<PathBuf> {
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| home().map(|h| h.join(".config")))
     };
     base.map(|b| b.join("ADE").join("config.json"))
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
 }
 
 fn read() -> Value {
@@ -45,26 +50,7 @@ fn set(key: &str, value: Value) -> Result<PathBuf> {
     cfg[key] = value;
     std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)
         .with_context(|| format!("écriture de {} impossible", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
     Ok(path)
-}
-
-pub fn load_api_key() -> Option<(String, KeySource)> {
-    if let Some(k) = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty()) {
-        return Some((k.trim().to_string(), KeySource::Env));
-    }
-    read()["api_key"]
-        .as_str()
-        .filter(|k| !k.trim().is_empty())
-        .map(|k| (k.trim().to_string(), KeySource::Saved))
-}
-
-pub fn save_api_key(key: &str) -> Result<PathBuf> {
-    set("api_key", json!(key))
 }
 
 /// The folder that contains the user's projects.
@@ -72,26 +58,101 @@ pub fn load_workspace() -> Option<PathBuf> {
     read()["workspace"].as_str().map(PathBuf::from).filter(|p| p.is_dir())
 }
 
-pub fn save_workspace(dir: &std::path::Path) -> Result<PathBuf> {
+pub fn save_workspace(dir: &Path) -> Result<PathBuf> {
     set("workspace", json!(dir.to_string_lossy()))
 }
 
-/// Checks the key with a free call (model listing): no tokens are billed.
-pub async fn validate(key: String) -> Result<(), String> {
-    let resp = reqwest::Client::new()
-        .get("https://api.anthropic.com/v1/models?limit=1")
-        .header("x-api-key", &key)
-        .header("anthropic-version", crate::agent::API_VERSION)
-        .send()
+// ---------------------------------------------------------------------------
+// Claude Code
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ClaudeCode {
+    pub path: PathBuf,
+    /// e.g. "2.0.14 (Claude Code)".
+    pub version: String,
+}
+
+/// The `claude` executable: PATH first, then the usual install locations
+/// (ADE may have been started before the installation updated the PATH).
+pub fn find_claude() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(h) = home() {
+        dirs.push(h.join(".local").join("bin"));
+        dirs.push(h.join(".claude").join("local"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(appdata).join("npm"));
+    }
+    dirs.iter()
+        .flat_map(|d| names.iter().map(move |n| d.join(n)))
+        .find(|p| p.is_file())
+}
+
+/// Finds Claude Code and checks that it runs (`claude --version`).
+pub async fn detect_claude() -> Result<ClaudeCode, String> {
+    let path = find_claude().ok_or("Claude Code est introuvable sur ce poste.")?;
+    let mut cmd = tokio::process::Command::new(&path);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(crate::agent::CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
         .await
-        .map_err(|e| format!("Impossible de joindre l'API : {e}"))?;
-    match resp.status().as_u16() {
-        200..=299 => Ok(()),
-        401 => Err("Clé API invalide.".into()),
-        403 => Err("Cette clé n'a pas accès à l'API.".into()),
-        s => {
-            let body = resp.text().await.unwrap_or_default();
-            Err(format!("Réponse inattendue de l'API ({s}) : {body}"))
+        .map_err(|_| "Claude Code ne répond pas (`claude --version`).".to_string())?
+        .map_err(|e| format!("Impossible de lancer {} : {e}", path.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`claude --version` a échoué : {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(ClaudeCode { path, version })
+}
+
+/// Opens Claude Code in a terminal so the user can log in with their
+/// Claude account (`/login`).
+pub fn open_login(claude: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new(claude);
+        if let Some(h) = home() {
+            cmd.current_dir(h);
         }
+        cmd.creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Impossible d'ouvrir Claude Code : {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = claude;
+        Err("Lancez `claude` dans un terminal puis tapez /login.".into())
+    }
+}
+
+/// Runs the official Claude Code installer in a new terminal.
+pub fn open_installer() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("powershell")
+            .args(["-NoExit", "-ExecutionPolicy", "Bypass", "-Command", INSTALL_COMMAND])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Impossible de lancer PowerShell : {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        Err(format!("Dans un terminal : {INSTALL_COMMAND}"))
     }
 }

@@ -10,7 +10,6 @@ mod config;
 mod media;
 mod projects;
 mod sessions;
-mod tools;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -85,13 +84,13 @@ enum Message {
     PasteImage(bool),
     ImagePasted(PathBuf, bool, Result<clipboard::Attachment, String>),
     RemoveAttachment(usize),
-    // API key
-    KeyInputChanged(String),
-    SubmitKey,
-    KeyValidated(Result<(), String>),
-    OpenKeysPage,
-    ChangeKey,
-    CancelKeySetup,
+    // Claude Code (the Claude subscription)
+    ShowClaudeSetup,
+    CloseClaudeSetup,
+    CheckClaude,
+    ClaudeChecked(Result<config::ClaudeCode, String>),
+    InstallClaude,
+    LoginClaude,
     // Now playing (Spotify in the browser, or any media session)
     MediaTick,
     MediaUpdated(Option<media::NowPlaying>),
@@ -101,10 +100,9 @@ enum Message {
 }
 
 #[derive(Default)]
-struct KeySetup {
-    input: String,
-    error: Option<String>,
+struct ClaudeSetup {
     checking: bool,
+    error: Option<String>,
 }
 
 struct WorkspaceSetup {
@@ -144,6 +142,10 @@ enum ChatItem {
 struct Conversation {
     chat: Vec<ChatItem>,
     history: agent::History,
+    /// Claude Code session holding the context of this conversation.
+    session: Option<String>,
+    /// Model reported by Claude Code.
+    model: Option<String>,
     tokens: (u64, u64, u64),
     /// Draft message, kept when switching projects.
     input: String,
@@ -159,6 +161,8 @@ impl Default for Conversation {
         Self {
             chat: Vec::new(),
             history: Arc::new(Mutex::new(Vec::new())),
+            session: None,
+            model: None,
             tokens: (0, 0, 0),
             input: String::new(),
             attachments: Vec::new(),
@@ -171,11 +175,11 @@ impl Default for Conversation {
 impl Conversation {
     /// Restores a conversation saved by a previous session.
     fn from_saved(saved: sessions::Saved) -> Self {
-        let chat = chat_from_history(&saved.history, &saved.diffs);
+        let chat = chat_from_history(&saved.root, &saved.history, &saved.diffs);
         let history: agent::History = Arc::new(Mutex::new(saved.history));
         // ADE may have been killed in the middle of a tool call.
         agent::repair(&history);
-        Self { chat, history, tokens: saved.tokens, ..Self::default() }
+        Self { chat, history, session: saved.session, tokens: saved.tokens, ..Self::default() }
     }
 
     fn find_tool(&mut self, id: &str) -> Option<&mut ChatItem> {
@@ -191,8 +195,11 @@ struct Ade {
     projects: Vec<PathBuf>,
     root: Option<PathBuf>,
     convs: HashMap<PathBuf, Conversation>,
-    api_key: Option<(String, config::KeySource)>,
-    key_setup: Option<KeySetup>,
+    /// Claude Code, once detected and checked.
+    claude: Option<config::ClaudeCode>,
+    /// Detection in progress (at startup or after "Vérifier").
+    claude_checking: bool,
+    claude_setup: Option<ClaudeSetup>,
     workspace_setup: Option<WorkspaceSetup>,
     new_project: Option<NewProject>,
     status: String,
@@ -210,16 +217,17 @@ impl Ade {
                 .into_iter()
                 .map(|s| (s.root.clone(), Conversation::from_saved(s)))
                 .collect(),
-            api_key: config::load_api_key(),
-            key_setup: None,
+            claude: None,
+            claude_checking: true,
+            claude_setup: None,
             workspace_setup: None,
             new_project: None,
             status: "Prêt".into(),
             now_playing: None,
         };
-        // First launch: API key, then workspace folder.
-        if app.api_key.is_none() {
-            app.key_setup = Some(KeySetup::default());
+        // First launch: Claude Code, then workspace folder.
+        if config::find_claude().is_none() {
+            app.claude_setup = Some(ClaudeSetup::default());
         }
         if app.workspace.is_none() {
             app.workspace_setup = Some(WorkspaceSetup { path: projects::suggested_workspace(), error: None });
@@ -231,7 +239,8 @@ impl Ade {
         let maximize = iced::window::get_oldest()
             .and_then(|id| iced::window::maximize(id, true));
         let media = Task::perform(media::current(), Message::MediaUpdated);
-        (app, Task::batch([maximize, media]))
+        let claude = Task::perform(config::detect_claude(), Message::ClaudeChecked);
+        (app, Task::batch([maximize, media, claude]))
     }
 
     fn title(&self) -> String {
@@ -274,7 +283,7 @@ impl Ade {
             .collect();
         let result = {
             let history = conv.history.lock().unwrap();
-            sessions::save(project, &history, conv.tokens, &diffs)
+            sessions::save(project, conv.session.as_deref(), &history, conv.tokens, &diffs)
         };
         if let Err(e) = result {
             self.status = format!("Sauvegarde de la conversation impossible : {e:#}");
@@ -408,7 +417,7 @@ impl Ade {
             Message::PasteImage(explicit) => {
                 // Only when the chat is visible (not on the setup screens).
                 let Some(root) = self.root.clone() else { return Task::none() };
-                if self.key_setup.is_some() || self.workspace_setup.is_some() {
+                if self.claude_setup.is_some() || self.workspace_setup.is_some() {
                     return Task::none();
                 }
                 return Task::perform(clipboard::read_image(), move |r| {
@@ -430,57 +439,55 @@ impl Ade {
                     }
                 }
             }
-            Message::KeyInputChanged(s) => {
-                if let Some(setup) = &mut self.key_setup {
-                    setup.input = s;
-                    setup.error = None;
+            Message::ShowClaudeSetup => self.claude_setup = Some(ClaudeSetup::default()),
+            Message::CloseClaudeSetup => {
+                if self.claude.is_some() {
+                    self.claude_setup = None;
                 }
             }
-            Message::SubmitKey => {
-                if let Some(setup) = &mut self.key_setup {
-                    let key = setup.input.trim().to_string();
-                    if key.is_empty() || setup.checking {
-                        return Task::none();
-                    }
+            Message::CheckClaude => {
+                if self.claude_checking {
+                    return Task::none();
+                }
+                self.claude_checking = true;
+                if let Some(setup) = &mut self.claude_setup {
                     setup.checking = true;
                     setup.error = None;
-                    return Task::perform(config::validate(key), Message::KeyValidated);
                 }
+                return Task::perform(config::detect_claude(), Message::ClaudeChecked);
             }
-            Message::KeyValidated(result) => {
-                if let Some(setup) = &mut self.key_setup {
-                    setup.checking = false;
-                    match result {
-                        Ok(()) => {
-                            let key = setup.input.trim().to_string();
-                            match config::save_api_key(&key) {
-                                Ok(_) => {
-                                    self.api_key = Some((key, config::KeySource::Saved));
-                                    self.key_setup = None;
-                                    self.status = "Clé API enregistrée".into();
-                                }
-                                Err(e) => setup.error = Some(format!("{e:#}")),
-                            }
+            Message::ClaudeChecked(result) => {
+                self.claude_checking = false;
+                match result {
+                    Ok(found) => {
+                        self.claude = Some(found);
+                        if let Some(setup) = &mut self.claude_setup {
+                            setup.checking = false;
+                            setup.error = None;
                         }
-                        Err(e) => setup.error = Some(e),
+                    }
+                    Err(e) => {
+                        self.claude = None;
+                        let setup = self.claude_setup.get_or_insert_with(ClaudeSetup::default);
+                        setup.checking = false;
+                        setup.error = Some(e);
                     }
                 }
             }
-            Message::OpenKeysPage => {
-                if let Err(e) = open::that(config::KEYS_URL) {
-                    self.status = format!("Impossible d'ouvrir le navigateur : {e}");
+            Message::InstallClaude => {
+                if let Err(e) = config::open_installer() {
+                    if let Some(setup) = &mut self.claude_setup {
+                        setup.error = Some(e);
+                    }
                 }
             }
-            Message::ChangeKey => {
-                if self.running_count() == 0 {
-                    self.key_setup = Some(KeySetup::default());
-                } else {
-                    self.status = "Attendez la fin des agents en cours pour changer de clé".into();
-                }
-            }
-            Message::CancelKeySetup => {
-                if self.api_key.is_some() {
-                    self.key_setup = None;
+            Message::LoginClaude => {
+                if let Some(c) = &self.claude {
+                    if let Err(e) = config::open_login(&c.path) {
+                        if let Some(setup) = &mut self.claude_setup {
+                            setup.error = Some(e);
+                        }
+                    }
                 }
             }
             Message::MediaTick => return Task::perform(media::current(), Message::MediaUpdated),
@@ -508,8 +515,12 @@ impl Ade {
             self.status = "Sélectionnez d'abord un projet dans la liste de gauche".into();
             return Task::none();
         };
-        let Some((api_key, _)) = self.api_key.clone() else {
-            self.key_setup = Some(KeySetup::default());
+        let Some(claude) = self.claude.as_ref().map(|c| c.path.clone()) else {
+            if self.claude_checking {
+                self.status = "Recherche de Claude Code…".into();
+            } else {
+                self.claude_setup = Some(ClaudeSetup::default());
+            }
             return Task::none();
         };
         let conv = self.convs.entry(root.clone()).or_default();
@@ -524,7 +535,7 @@ impl Ade {
         let images: Vec<String> = attachments.into_iter().map(|a| a.png_base64).collect();
         conv.chat.push(ChatItem::User(prompt.clone(), thumbs));
 
-        let cfg = agent::Config { api_key, root: root.clone(), effort: "high".into() };
+        let cfg = agent::Config { claude, root: root.clone(), session: conv.session.clone() };
         let history = conv.history.clone();
         let stream = iced::stream::channel(256, move |out| agent::run(cfg, history, prompt, images, out));
         let (task, handle) =
@@ -538,6 +549,12 @@ impl Ade {
         let visible = self.root.as_ref() == Some(&project);
         let Some(conv) = self.convs.get_mut(&project) else { return };
         match ev {
+            AgentEvent::Session { id, model } => {
+                conv.session = Some(id);
+                if model.is_some() {
+                    conv.model = model;
+                }
+            }
             AgentEvent::TextDelta(t) => match conv.chat.last_mut() {
                 Some(ChatItem::Assistant(s)) => s.push_str(&t),
                 _ => conv.chat.push(ChatItem::Assistant(t)),
@@ -556,7 +573,7 @@ impl Ade {
                 expanded: false,
             }),
             AgentEvent::ToolCall { id, name, input } => {
-                let s = summarize(&name, &input);
+                let s = summarize(&project, &name, &input);
                 if let Some(ChatItem::Tool { summary, .. }) = conv.find_tool(&id) {
                     *summary = s;
                 }
@@ -616,15 +633,15 @@ impl Ade {
                 .color(MUTED),
             horizontal_space(),
             self.view_now_playing(),
-            self.view_key_status(),
+            self.view_claude_status(),
             button(text("Nouvelle conversation").size(12)).on_press(Message::NewChat).style(button::text),
         ]
         .spacing(12)
         .padding([6, 12])
         .align_y(Alignment::Center);
 
-        let main: Element<'_, Message> = if let Some(setup) = &self.key_setup {
-            self.view_key_setup(setup)
+        let main: Element<'_, Message> = if let Some(setup) = &self.claude_setup {
+            self.view_claude_setup(setup)
         } else if let Some(setup) = &self.workspace_setup {
             self.view_workspace_setup(setup)
         } else {
@@ -647,11 +664,12 @@ impl Ade {
             1 => "1 agent actif".into(),
             n => format!("{n} agents actifs"),
         };
+        let model = self.conv().and_then(|c| c.model.clone()).unwrap_or_else(|| "Claude Code".into());
         let status = row![
             text(current).size(11).color(MUTED),
             horizontal_space(),
             text(active).size(11).color(BLUE),
-            text(format!("{}  ·  in {}  ·  out {}  ·  cache {}", agent::MODEL, t.0, t.1, t.2))
+            text(format!("{model}  ·  in {}  ·  out {}  ·  cache {}", t.0, t.1, t.2))
                 .size(11)
                 .color(MUTED),
         ]
@@ -843,89 +861,109 @@ impl Ade {
         .into()
     }
 
-    fn view_key_status(&self) -> Element<'_, Message> {
-        match &self.api_key {
-            Some((_, config::KeySource::Env)) => {
-                row![
-                    text("●").size(12).font(SYMBOL).color(GREEN),
-                    text("Clé API (ANTHROPIC_API_KEY)").size(12).color(GREEN),
-                ]
-                .spacing(4)
-                .align_y(Alignment::Center)
-                .into()
-            }
-            Some((key, config::KeySource::Saved)) => {
-                let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-                button(
-                    row![
-                        text("●").size(12).font(SYMBOL).color(GREEN),
-                        text(format!("Clé API …{tail}")).size(12).color(GREEN),
-                    ]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
-                )
-                    .on_press(Message::ChangeKey)
-                    .style(button::text)
-                    .into()
-            }
-            None => button(text("Ajouter une clé API").size(12))
-                .on_press(Message::ChangeKey)
-                .style(button::primary)
-                .into(),
-        }
+    fn view_claude_status(&self) -> Element<'_, Message> {
+        let (marker, label, color) = match &self.claude {
+            Some(c) => ("●", format!("Claude Code {}", c.version.trim_end_matches(" (Claude Code)")), GREEN),
+            None if self.claude_checking => ("○", "Claude Code…".to_string(), MUTED),
+            None => ("●", "Claude Code non configuré".to_string(), RED),
+        };
+        button(
+            row![
+                text(marker).size(12).font(SYMBOL).color(color),
+                text(label).size(12).color(color),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::ShowClaudeSetup)
+        .style(button::text)
+        .into()
     }
 
-    fn view_key_setup<'a>(&'a self, setup: &'a KeySetup) -> Element<'a, Message> {
-        let first_launch = self.api_key.is_none();
-        let can_submit = !setup.input.trim().is_empty() && !setup.checking;
+    fn view_claude_setup<'a>(&'a self, setup: &'a ClaudeSetup) -> Element<'a, Message> {
+        let found = self.claude.as_ref();
+        let checking = setup.checking || self.claude_checking;
 
-        let mut actions = row![button(text(if setup.checking { "Vérification…" } else { "Valider" }).size(13))
-            .on_press_maybe(can_submit.then_some(Message::SubmitKey))
-            .style(button::primary)
+        let state: Element<'_, Message> = match found {
+            Some(c) => column![
+                text(format!("✓ {} détecté", c.version)).size(13).font(SYMBOL).color(GREEN),
+                text(c.path.display().to_string()).size(11).font(Font::MONOSPACE).color(MUTED),
+            ]
+            .spacing(2)
+            .into(),
+            None if checking => text("Recherche de Claude Code…").size(13).color(MUTED).into(),
+            None => text("Claude Code n'est pas installé sur ce poste (ou reste introuvable).").size(13).color(RED).into(),
+        };
+
+        let step = |title: &'a str, body: Element<'a, Message>| -> Element<'a, Message> {
+            column![text(title).size(14).font(BOLD), body].spacing(6).into()
+        };
+        let install = step(
+            "1. Installer Claude Code",
+            column![
+                row![
+                    container(text(config::INSTALL_COMMAND).size(12).font(Font::MONOSPACE))
+                        .padding(8)
+                        .width(Length::Fill)
+                        .style(code_box),
+                    button(text("Installer…").size(13))
+                        .on_press(Message::InstallClaude)
+                        .style(if found.is_some() { button::secondary } else { button::primary })
+                        .padding([7, 14]),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                text("Ouvre PowerShell et lance l'installeur officiel. Cliquez ensuite sur « Vérifier ».")
+                    .size(11)
+                    .color(MUTED),
+            ]
+            .spacing(4)
+            .into(),
+        );
+        let login = step(
+            "2. Se connecter avec votre compte Claude",
+            column![
+                button(text("Se connecter…").size(13))
+                    .on_press_maybe(found.map(|_| Message::LoginClaude))
+                    .style(if found.is_some() { button::primary } else { button::secondary })
+                    .padding([7, 14]),
+                text("Ouvre Claude Code dans un terminal : choisissez la connexion avec votre compte Claude (abonnement) ou tapez /login, puis fermez le terminal.")
+                    .size(11)
+                    .color(MUTED),
+            ]
+            .spacing(4)
+            .into(),
+        );
+
+        let mut actions = row![button(text(if checking { "Vérification…" } else { "Vérifier" }).size(13))
+            .on_press_maybe((!checking).then_some(Message::CheckClaude))
+            .style(button::secondary)
             .padding([8, 16])]
         .spacing(8);
-        if !first_launch {
+        if found.is_some() {
             actions = actions.push(
-                button(text("Annuler").size(13))
-                    .on_press(Message::CancelKeySetup)
-                    .style(button::secondary)
+                button(text("Continuer").size(13))
+                    .on_press(Message::CloseClaudeSetup)
+                    .style(button::primary)
                     .padding([8, 16]),
             );
         }
 
         let mut form = column![
-            text(if first_launch { "Bienvenue dans ADE" } else { "Changer de clé API" }).size(22),
-            text("ADE utilise l'API Claude. Entrez une clé API pour activer l'agent.")
+            text(if found.is_some() { "Claude Code" } else { "Bienvenue dans ADE" }).size(22),
+            text("ADE utilise votre abonnement Claude (Pro ou Max) par l'intermédiaire de Claude Code, qui doit être installé sur ce poste et connecté à votre compte.")
                 .size(13)
                 .color(MUTED),
-            text_input("sk-ant-api03-…", &setup.input)
-                .secure(true)
-                .on_input(Message::KeyInputChanged)
-                .on_submit(Message::SubmitKey)
-                .size(14)
-                .padding(10),
+            state,
+            install,
+            login,
         ]
-        .spacing(14)
-        .max_width(520);
-
+        .spacing(16)
+        .max_width(600);
         if let Some(err) = &setup.error {
             form = form.push(text(err).size(12).color(RED));
         }
-        form = form.push(actions).push(horizontal_rule(1)).push(
-            row![
-                text("Pas encore de clé ?").size(13).color(MUTED),
-                button(text("Créer une clé API sur platform.claude.com ↗").size(13).color(BLUE))
-                    .on_press(Message::OpenKeysPage)
-                    .style(button::text)
-                    .padding(0),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-        let location = config::path()
-            .map(|p| format!("La clé sera vérifiée puis enregistrée dans {}", p.display()))
-            .unwrap_or_default();
-        form = form.push(text(location).size(11).color(MUTED));
+        form = form.push(actions);
 
         container(form).center(Length::Fill).padding(24).into()
     }
@@ -1135,7 +1173,7 @@ fn view_assistant(s: &str) -> Element<'_, Message> {
 }
 
 /// Rebuilds the chat view of a saved conversation from its API history.
-fn chat_from_history(history: &[serde_json::Value], diffs: &HashMap<String, String>) -> Vec<ChatItem> {
+fn chat_from_history(root: &Path, history: &[serde_json::Value], diffs: &HashMap<String, String>) -> Vec<ChatItem> {
     use base64::Engine;
     let mut chat: Vec<ChatItem> = Vec::new();
     for msg in history {
@@ -1216,7 +1254,7 @@ fn chat_from_history(history: &[serde_json::Value], diffs: &HashMap<String, Stri
                         let name = b["name"].as_str().unwrap_or_default().to_string();
                         chat.push(ChatItem::Tool {
                             id: b["id"].as_str().unwrap_or_default().to_string(),
-                            summary: summarize(&name, &b["input"]),
+                            summary: summarize(root, &name, &b["input"]),
                             name,
                             output: None,
                             is_error: false,
@@ -1232,15 +1270,22 @@ fn chat_from_history(history: &[serde_json::Value], diffs: &HashMap<String, Stri
     chat
 }
 
-fn summarize(name: &str, input: &serde_json::Value) -> String {
+/// One-line description of a tool call (Claude Code tools, plus the former
+/// ADE tools found in older saved conversations).
+fn summarize(root: &Path, name: &str, input: &serde_json::Value) -> String {
+    let field = |k: &str| input[k].as_str().unwrap_or_default();
+    let path = |k: &str| agent::relative(root, field(k));
     let s = match name {
-        "run_command" => input["command"].as_str().unwrap_or_default().to_string(),
-        "search" => format!(
-            "/{}/ {}",
-            input["pattern"].as_str().unwrap_or_default(),
-            input["path"].as_str().unwrap_or_default()
-        ),
-        _ => input["path"].as_str().unwrap_or_default().to_string(),
+        "Bash" | "run_command" => field("command").to_string(),
+        "Read" | "Write" | "Edit" | "MultiEdit" => path("file_path"),
+        "NotebookEdit" => path("notebook_path"),
+        "Grep" | "search" => format!("/{}/ {}", field("pattern"), path("path")).trim_end().to_string(),
+        "Glob" => field("pattern").to_string(),
+        "WebFetch" => field("url").to_string(),
+        "WebSearch" => field("query").to_string(),
+        "Task" => field("description").to_string(),
+        "TodoWrite" => format!("{} tâche(s)", input["todos"].as_array().map_or(0, |t| t.len())),
+        _ => path("path"),
     };
     clip(&s, 80)
 }

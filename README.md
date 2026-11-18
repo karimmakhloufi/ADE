@@ -1,7 +1,8 @@
 # ADE
 
 Environnement de développement agentique minimaliste, écrit en Rust avec [iced](https://iced.rs).
-L'agent est piloté par Claude (`claude-opus-5-5`) via l'API Messages.
+L'agent est **Claude Code**, piloté en mode non interactif : ADE utilise donc votre **abonnement Claude**
+(Pro ou Max), sans clé API.
 ADE sert uniquement à dialoguer avec Claude : il n'ouvre ni n'édite aucun fichier lui-même,
 c'est l'agent qui lit et modifie le projet (les modifications s'affichent en diff dans le chat).
 
@@ -31,33 +32,39 @@ Au premier lancement, ADE demande votre dossier de travail. Chacun de ses sous-d
 comme un projet dans la colonne de gauche ; cliquer dessus le sélectionne pour l'agent. Chaque projet
 garde sa conversation tant qu'ADE reste ouvert. « Changer de dossier de travail » en bas de la liste.
 
-## Clé API
+## Abonnement Claude (Claude Code)
 
-Au premier lancement, ADE demande une clé API Claude (à créer sur
-[platform.claude.com/settings/keys](https://platform.claude.com/settings/keys), lien disponible dans l'écran).
-La clé est vérifiée (appel gratuit à `/v1/models`) puis enregistrée dans
-`%APPDATA%\ADE\config.json` (Windows) ou `~/.config/ADE/config.json`.
-Cliquez sur l'indicateur « ● Clé API … » en haut pour la changer.
+ADE a besoin de [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup) installé et connecté
+à votre compte Claude. Si Claude Code est introuvable, ADE affiche un écran de configuration :
 
-La variable d'environnement `ANTHROPIC_API_KEY`, si elle est définie, est prioritaire sur le fichier.
+1. **Installer** : lance l'installeur officiel (`irm https://claude.ai/install.ps1 | iex` dans PowerShell) ;
+2. **Se connecter** : ouvre Claude Code dans un terminal pour se connecter avec son compte Claude (`/login`).
+
+Cliquez sur l'indicateur « ● Claude Code … » en haut pour revenir à cet écran.
+
+Pour chaque message, ADE lance dans le dossier du projet :
+
+```
+claude -p --input-format stream-json --output-format stream-json --verbose
+       --include-partial-messages --permission-mode bypassPermissions [--resume <session>]
+```
+
+- `ANTHROPIC_API_KEY` est retirée de l'environnement de Claude Code, pour que l'abonnement soit utilisé
+  même si cette variable est définie.
+- Chaque projet a sa session Claude Code, reprise avec `--resume` (le contexte est conservé par Claude Code).
+  « Nouvelle conversation » démarre une nouvelle session.
+- « Stop » termine Claude Code et tout ce qu'il a lancé.
+- L'usage est décompté des limites de l'abonnement ; les compteurs de tokens restent affichés pour information.
 
 ## Outils de l'agent
 
-| Outil         | Effet                                                        |
-|---------------|--------------------------------------------------------------|
-| `list_dir`    | liste un dossier                                             |
-| `read_file`   | lit un fichier (plage de lignes optionnelle)                 |
-| `search`      | recherche regex dans le projet (respecte `.gitignore`)       |
-| `write_file`  | crée / remplace un fichier, diff affiché dans le chat        |
-| `edit_file`   | remplacement exact d'un extrait, diff affiché dans le chat   |
-| `run_command` | commande shell (`cmd /C` ou `sh -c`), **autorisation requise** |
-
-Tous les chemins sont confinés à la racine du projet (`..`, chemins absolus et liens symboliques sortants refusés).
+Ce sont ceux de Claude Code (`Read`, `Edit`, `Write`, `Bash`, `Grep`, `Glob`, `WebFetch`…), exécutés
+**sans demande de confirmation** (`bypassPermissions`). Les éditions s'affichent en diff dans le chat.
 
 ## Structure
 
 - `src/main.rs`  : interface iced (état, messages, vues)
-- `src/agent.rs` : boucle agentique, streaming SSE, historique de conversation
-- `src/tools.rs` : définitions et exécution des outils
-- `src/projects.rs` : liste des projets (sous-dossiers du dossier de travail)
-- `src/config.rs` : clé API et dossier de travail (`config.json`)
+- `src/agent.rs` : lancement de Claude Code et lecture de ses événements stream-json
+- `src/sessions.rs` : sauvegarde des conversations (session Claude Code + transcription)
+- `src/projects.rs` : liste et création des projets (sous-dossiers du dossier de travail)
+- `src/config.rs` : dossier de travail (`config.json`), détection / installation / connexion de Claude Code
